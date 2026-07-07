@@ -16,8 +16,12 @@ import requests
 REDIS_URL = os.environ["REDIS_URL"]
 PAYMENTS_URL = os.environ["PAYMENTS_URL"]
 ORDERS_STREAM = "orders"
+ORDERS_GROUP = "order-workers"
+CONSUMER_NAME = os.environ.get("CONSUMER_NAME", "worker-1")
+ORDER_KEY_PREFIX = "order:"
 CHARGE_MAX_RETRIES = 5
 CHARGE_BACKOFF_SECONDS = 1
+CHARGE_TIMEOUT_SECONDS = 30
 
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -31,6 +35,7 @@ def charge_order(order):
                     "order_id": order["order_id"],
                     "amount_cents": order["amount_cents"],
                 },
+                timeout=CHARGE_TIMEOUT_SECONDS,
             )
             resp.raise_for_status()
             return
@@ -48,27 +53,72 @@ def charge_order(order):
             time.sleep(backoff)
 
 
+def ensure_consumer_group():
+    try:
+        r.xgroup_create(ORDERS_STREAM, ORDERS_GROUP, id="0", mkstream=True)
+    except redis.exceptions.ResponseError as exc:
+        if "BUSYGROUP" not in str(exc):
+            raise
+
+
+def claim_order(order):
+    order_key = f"{ORDER_KEY_PREFIX}{order['order_id']}"
+    claimed = r.hsetnx(order_key, "worker_status", "processing")
+
+    if not claimed:
+        status = r.hget(order_key, "worker_status")
+        return False, status
+
+    r.hset(order_key, "status", "processing")
+    return True, "processing"
+
+
 def process(order):
-    # Charge the customer, then record it in the ledger.
-    charge_order(order)
+    claimed, status = claim_order(order)
+
+    if not claimed:
+        if status:
+            r.hset(f"{ORDER_KEY_PREFIX}{order['order_id']}", "status", status)
+        print(
+            f"skipping {order['order_id']} because status is {status}",
+            flush=True,
+        )
+        return
+
+    order_key = f"{ORDER_KEY_PREFIX}{order['order_id']}"
+
+    try:
+        # Charge the customer, then record it in the ledger.
+        charge_order(order)
+    except requests.exceptions.RequestException:
+        r.hset(order_key, mapping={"status": "failed", "worker_status": "failed"})
+        print(f"failed {order['order_id']}", flush=True)
+        return
 
     r.incrby(f"ledger:{order['customer_id']}", order["amount_cents"])
     r.incr("processed_count")
+    r.hset(order_key, mapping={"status": "success", "worker_status": "success"})
     print(f"processed {order['order_id']} for {order['customer_id']}", flush=True)
 
 
 def main():
     print("worker started", flush=True)
-    last_id = "$"  # start from new messages
+    ensure_consumer_group()
     while True:
-        resp = r.xread({ORDERS_STREAM: last_id}, count=10, block=5000)
+        resp = r.xreadgroup(
+            ORDERS_GROUP,
+            CONSUMER_NAME,
+            {ORDERS_STREAM: ">"},
+            count=10,
+            block=5000,
+        )
         if not resp:
             continue
         for _stream, messages in resp:
             for msg_id, fields in messages:
-                last_id = msg_id
                 order = json.loads(fields["data"])
                 process(order)
+                r.xack(ORDERS_STREAM, ORDERS_GROUP, msg_id)
 
 
 if __name__ == "__main__":

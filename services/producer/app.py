@@ -11,6 +11,12 @@ from pydantic import BaseModel
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 ORDERS_STREAM = "orders"
+ORDER_KEY_PREFIX = "order:"
+QUEUE_ORDER_SCRIPT = """
+redis.call("HSET", KEYS[1], "order_payload", ARGV[1], "status", "queued")
+redis.call("XADD", KEYS[2], "*", "data", ARGV[2])
+return 1
+"""
 
 r = redis.from_url(REDIS_URL, decode_responses=True)
 app = FastAPI(title="orders-producer")
@@ -26,9 +32,20 @@ class Order(BaseModel):
 def create_order(order: Order):
     # At-least-once upstreams (load balancers, client retries, redrives) mean the
     # same order_id can legitimately arrive here more than once. That's expected.
-    r.xadd(ORDERS_STREAM, {"data": json.dumps(order.model_dump())})
-    return {"status": "queued", "order_id": order.order_id}
+    order_payload = order.model_dump()
+    event = dict(order_payload)
+    order_key = f"{ORDER_KEY_PREFIX}{order.order_id}"
+    event["status"] = "queued"
 
+    r.eval(
+        QUEUE_ORDER_SCRIPT,
+        2,
+        order_key,
+        ORDERS_STREAM,
+        json.dumps(order_payload),
+        json.dumps(event),
+    )
+    return {"status": "queued", "order_id": order.order_id}
 
 @app.get("/ledger")
 def ledger():
