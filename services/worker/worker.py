@@ -8,6 +8,7 @@ Your job: make this production-grade. See the README.
 """
 import json
 import os
+import time
 
 import redis
 import requests
@@ -15,17 +16,41 @@ import requests
 REDIS_URL = os.environ["REDIS_URL"]
 PAYMENTS_URL = os.environ["PAYMENTS_URL"]
 ORDERS_STREAM = "orders"
+CHARGE_MAX_RETRIES = 5
+CHARGE_BACKOFF_SECONDS = 1
 
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
 
+def charge_order(order):
+    for attempt in range(CHARGE_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                f"{PAYMENTS_URL}/charge",
+                json={
+                    "order_id": order["order_id"],
+                    "amount_cents": order["amount_cents"],
+                },
+            )
+            resp.raise_for_status()
+            return
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code != 500 or attempt == CHARGE_MAX_RETRIES:
+                raise
+
+            backoff = CHARGE_BACKOFF_SECONDS * (2**attempt)
+            print(
+                f"charge failed with 500 for {order['order_id']}; "
+                f"retrying in {backoff}s ({attempt + 1}/{CHARGE_MAX_RETRIES})",
+                flush=True,
+            )
+            time.sleep(backoff)
+
+
 def process(order):
     # Charge the customer, then record it in the ledger.
-    resp = requests.post(
-        f"{PAYMENTS_URL}/charge",
-        json={"order_id": order["order_id"], "amount_cents": order["amount_cents"]},
-    )
-    resp.raise_for_status()
+    charge_order(order)
 
     r.incrby(f"ledger:{order['customer_id']}", order["amount_cents"])
     r.incr("processed_count")
