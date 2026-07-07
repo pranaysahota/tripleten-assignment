@@ -61,20 +61,23 @@ def ensure_consumer_group():
             raise
 
 
-def claim_order(order):
+def claim_order(order, retry_processing=False):
     order_key = f"{ORDER_KEY_PREFIX}{order['order_id']}"
     claimed = r.hsetnx(order_key, "worker_status", "processing")
 
     if not claimed:
         status = r.hget(order_key, "worker_status")
+        if retry_processing and status == "processing":
+            r.hset(order_key, "status", "processing")
+            return True, status
         return False, status
 
     r.hset(order_key, "status", "processing")
     return True, "processing"
 
 
-def process(order):
-    claimed, status = claim_order(order)
+def process(order, retry_processing=False):
+    claimed, status = claim_order(order, retry_processing=retry_processing)
 
     if not claimed:
         if status:
@@ -101,24 +104,49 @@ def process(order):
     print(f"processed {order['order_id']} for {order['customer_id']}", flush=True)
 
 
+def read_pending_messages():
+    return r.xreadgroup(
+        ORDERS_GROUP,
+        CONSUMER_NAME,
+        {ORDERS_STREAM: "0"},
+        count=10,
+    )
+
+
+def read_new_messages():
+    return r.xreadgroup(
+        ORDERS_GROUP,
+        CONSUMER_NAME,
+        {ORDERS_STREAM: ">"},
+        count=10,
+        block=5000,
+    )
+
+
+def handle_messages(resp, retry_processing=False):
+    for _stream, messages in resp:
+        for msg_id, fields in messages:
+            order = json.loads(fields["data"])
+            process(order, retry_processing=retry_processing)
+            r.xack(ORDERS_STREAM, ORDERS_GROUP, msg_id)
+
+
+def has_messages(resp):
+    return any(messages for _stream, messages in resp)
+
+
 def main():
     print("worker started", flush=True)
     ensure_consumer_group()
     while True:
-        resp = r.xreadgroup(
-            ORDERS_GROUP,
-            CONSUMER_NAME,
-            {ORDERS_STREAM: ">"},
-            count=10,
-            block=5000,
-        )
-        if not resp:
+        pending = read_pending_messages()
+        if has_messages(pending):
+            handle_messages(pending, retry_processing=True)
             continue
-        for _stream, messages in resp:
-            for msg_id, fields in messages:
-                order = json.loads(fields["data"])
-                process(order)
-                r.xack(ORDERS_STREAM, ORDERS_GROUP, msg_id)
+
+        new_messages = read_new_messages()
+        if has_messages(new_messages):
+            handle_messages(new_messages)
 
 
 if __name__ == "__main__":
